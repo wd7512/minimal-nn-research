@@ -1,0 +1,4 @@
+[submodule "vendor/minimal-nn-competition"]
+	path = vendor/minimal-nn-competition
+	url = https://github.com/wd7512/minimal-nn-competition.git
+	branch = dev
