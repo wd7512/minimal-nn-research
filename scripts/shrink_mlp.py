@@ -124,7 +124,10 @@ class Shrinker:
             tot = 0
             for b in perm.split(bs):
                 opt.zero_grad(set_to_none=True)
-                loss = self.lf(model(self.Xn[b]), self.yn[b])
+                pred = model(self.Xn[b])
+                if self.task == "regress":
+                    pred = pred.squeeze(1)
+                loss = self.lf(pred, self.yn[b])
                 loss.backward()
                 opt.step()
                 tot += loss.item() * len(b)
