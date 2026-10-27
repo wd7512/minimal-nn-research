@@ -52,21 +52,29 @@ def prune_idx(sd, layer):
 
 def drop_neuron(sd, layer, idx, widths):
     """Return (new_sd, new_widths) with neuron idx removed from `layer`.
-    Later layers lose the corresponding input column; K=widths[-1] going to
-    0 drops the layer entirely (fresh output head)."""
+    Removes exactly one neuron; widths[layer] shrinks by one. Never
+    eliminates layers (use eliminate_last for that)."""
     new_widths = list(widths)
+    new_widths[layer] -= 1
+    assert new_widths[layer] >= 1, f"layer {layer} would go to 0; use eliminate_last"
     out = dict(sd)
     wk, bk = key(layer)
+    assert sd[wk].shape[0] == widths[layer], f"{wk} dim {sd[wk].shape[0]} != widths {widths}"
     keep = [i for i in range(widths[layer]) if i != idx]
     out[wk] = sd[wk][keep]
     out[bk] = sd[bk][keep]
     if layer + 1 < len(widths):
         nwk, nbk = key(layer + 1)
         out[nwk] = sd[nwk][:, keep]
-        out[nbk] = sd[nbk]
-    else:
-        new_widths = widths[:-1]  # last layer eliminated -> fresh head
-        out = {k: v for k, v in out.items() if not k.startswith(str(2 * layer))}
+    return out, new_widths
+
+
+def eliminate_last(sd, widths):
+    """Drop the final hidden layer entirely; head re-inits fresh in load_into."""
+    assert len(widths) > 1
+    new_widths = widths[:-1]
+    drop = {str(2 * (len(widths) - 1)), str(2 * len(widths))}
+    out = {k: v for k, v in sd.items() if k.split(".")[0] not in drop}
     return out, new_widths
 
 
@@ -154,7 +162,7 @@ class Shrinker:
                     own[k].copy_(v.to(self.device))
         return model
 
-    def attempt(self, widths, sd, tag, lrs=(3e-3, 1e-3, 3e-4), max_ep=MAX_EP):
+    def attempt(self, widths, sd, tag, lrs=(3e-3, 1e-3, 3e-4, 1e-4), max_ep=MAX_EP):
         """Train a shape to perfect, retrying with smaller LRs on failure."""
         model = self.load_into(widths, sd)
         best, bs = 0.0, None
@@ -222,6 +230,7 @@ def main():
     task = sys.argv[sys.argv.index("--task") + 1] if "--task" in sys.argv else "classify"
     in_dim = int(sys.argv[sys.argv.index("--in-dim") + 1]) if "--in-dim" in sys.argv else 784
     out_dim = int(sys.argv[sys.argv.index("--out-dim") + 1]) if "--out-dim" in sys.argv else 10
+    identity_k = "--identity-k" in sys.argv
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     s = Shrinker(data, device, out, data_format=fmt, task=task,
                  in_dim=in_dim, out_dim=out_dim)
@@ -233,9 +242,38 @@ def main():
     sd = {"0.weight": t["0.weight"][keep], "0.bias": t["0.bias"][keep]}
     if len(widths) > 1:
         sd["2.weight"] = t["2.weight"][:, keep] if t["2.weight"].shape[1] == len(keep) else None
+        sd["2.bias"] = t["2.bias"] if "2.bias" in t and t["2.bias"].shape[0] == t["2.weight"].shape[0] else None
+    if identity_k and len(widths) == 3 and "4.weight" in t and t["4.weight"].shape == (out_dim, widths[1]):
+        # init the fresh K layer as a pass-through of the first K neurons, so the
+        # 3-layer seed starts near the 2-layer teacher instead of from scratch
+        m, k = widths[1], widths[2]
+        w3 = torch.zeros(k, m)
+        for i in range(min(k, m)):
+            w3[i, i] = 1.0
+        sd["4.weight"] = w3
+        sd["4.bias"] = torch.zeros(k)
+        sd["6.weight"] = t["4.weight"][:, :k].clone()
+        sd["6.bias"] = t["4.bias"].clone()
+        print(f"identity-K init from teacher head (K={k})", flush=True)
     model = s.load_into(widths, {k: v for k, v in sd.items() if v is not None})
     seed_tag = "seed-" + "-".join(map(str, widths))
-    best, bs = s.attempt(widths, {k: v for k, v in sd.items() if v is not None}, seed_tag)
+    # resume: a previous run may already have proven this exact shape
+    seed_file = out / ("best" + "_".join(map(str, widths)) + ".pt")
+    if seed_file.exists():
+        try:
+            prev = torch.load(seed_file, map_location="cpu")
+            m0 = s.load_into(widths, prev)
+            if s.evaluate(m0) == 1.0:
+                print(f"resuming from proven {seed_file.name}", flush=True)
+                sd = {k: v.cpu().clone() for k, v in m0.state_dict().items()}
+                best, bs = 1.0, sd
+            else:
+                best, bs = s.attempt(widths, {k: v for k, v in sd.items() if v is not None}, seed_tag)
+        except Exception as e:
+            print(f"resume failed ({e}); retraining seed", flush=True)
+            best, bs = s.attempt(widths, {k: v for k, v in sd.items() if v is not None}, seed_tag)
+    else:
+        best, bs = s.attempt(widths, {k: v for k, v in sd.items() if v is not None}, seed_tag)
     if best != 1.0 or bs is None:
         print("seed shape failed; abort", flush=True)
         sys.exit(1)
@@ -246,9 +284,7 @@ def main():
         widths, sd = s.bisect_layer(widths, sd, layer)
     # last-layer elimination: bisect stops at 1, now try dropping it entirely
     if len(widths) > 1:
-        last = len(widths) - 1
-        idx = prune_idx(sd, last)
-        sd0, w0 = drop_neuron(sd, last, idx, widths)
+        sd0, w0 = eliminate_last(sd, widths)
         best, bs = s.attempt(w0, sd0, "K0-" + "-".join(map(str, w0)))
         if best == 1.0:
             widths, sd = w0, bs
