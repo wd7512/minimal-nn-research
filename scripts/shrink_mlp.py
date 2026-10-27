@@ -30,13 +30,13 @@ PATIENCE = 3000
 LOG_EVERY = 100
 
 
-def build(widths):
+def build(widths, in_dim=784, out_dim=10):
     layers = []
-    prev = 784
+    prev = in_dim
     for w in widths:
         layers += [nn.Linear(prev, w), nn.ReLU()]
         prev = w
-    layers.append(nn.Linear(prev, 10))
+    layers.append(nn.Linear(prev, out_dim))
     return nn.Sequential(*layers)
 
 
@@ -71,21 +71,42 @@ def drop_neuron(sd, layer, idx, widths):
 
 
 class Shrinker:
-    def __init__(self, data, device, out):
-        XP, yP = torch.load(data, map_location="cpu", weights_only=True)
-        self.Xn = (XP.float() / 255.0).to(device)
-        self.yn = yP.to(device)
+    def __init__(self, data, device, out, data_format="pt", task="classify", tol=0.1,
+                 in_dim=784, out_dim=10):
+        if data_format == "chess":
+            sys.path.insert(0, "/Users/williamdennis/repos/minimal-nn-competition/src")
+            from minimal_nn_competition.benchmarks.chess_eval.benchmark import load_tensors
+            X, y = load_tensors(data)
+            self.Xn = X.to(device)
+            self.yn = y.to(device)
+        else:
+            XP, yP = torch.load(data, map_location="cpu", weights_only=True)
+            self.Xn = (XP.float() / 255.0).to(device)
+            self.yn = yP.to(device)
         self.device = device
         self.out = out
-        self.lf = nn.CrossEntropyLoss()
+        self.task = task
+        self.tol = tol
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.lf = nn.MSELoss() if task == "regress" else nn.CrossEntropyLoss()
+
+    def score(self, model):
+        """Fraction of samples within tolerance (exact match for classify)."""
+        model.eval()
+        good = 0
+        total = len(self.Xn)
+        with torch.no_grad():
+            for b in torch.arange(total, device=self.device).split(8192):
+                if self.task == "regress":
+                    err = (model(self.Xn[b]).squeeze(1) - self.yn[b]).abs()
+                    good += (err <= self.tol).sum().item()
+                else:
+                    good += (model(self.Xn[b]).argmax(1) == self.yn[b]).sum().item()
+        return good / total
 
     def evaluate(self, model):
-        model.eval()
-        tc = 0
-        with torch.no_grad():
-            for b in torch.arange(len(self.Xn), device=self.device).split(8192):
-                tc += (model(self.Xn[b]).argmax(1) == self.yn[b]).sum().item()
-        return tc / len(self.Xn)
+        return self.score(model)
 
     def train_to_perfect(self, model, tag, max_ep=MAX_EP, lr=3e-3):
         opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
@@ -122,7 +143,7 @@ class Shrinker:
 
     def load_into(self, widths, sd):
         """Warm-start: copy every layer present in both; fresh-init the rest."""
-        model = build(widths).to(self.device)
+        model = build(widths, self.in_dim, self.out_dim).to(self.device)
         own = model.state_dict()
         with torch.no_grad():
             for k, v in sd.items():
@@ -130,12 +151,18 @@ class Shrinker:
                     own[k].copy_(v.to(self.device))
         return model
 
-    def attempt(self, widths, sd, tag):
+    def attempt(self, widths, sd, tag, lrs=(3e-3, 1e-3, 3e-4)):
+        """Train a shape to perfect, retrying with smaller LRs on failure."""
         model = self.load_into(widths, sd)
-        best, bs = self.train_to_perfect(model, tag)
-        if best == 1.0:
-            name = "best" + "_".join(map(str, widths)) + ".pt"
-            torch.save(bs, self.out / name)
+        best, bs = 0.0, None
+        for lr in lrs:
+            best, bs = self.train_to_perfect(model, f"{tag}-lr{lr}", lr=lr)
+            if best == 1.0:
+                name = "best" + "_".join(map(str, widths)) + ".pt"
+                torch.save(bs, self.out / name)
+                return best, bs
+            print(f"[{tag}] lr {lr} failed at {best:.6f}; retrying", flush=True)
+            model = self.load_into(widths, sd)  # fresh start, same warm weights
         return best, bs
 
     def shrink_first_sequential(self, widths, sd):
@@ -183,8 +210,13 @@ def main():
     out = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else SCRATCH_FALLBACK
     out.mkdir(parents=True, exist_ok=True)
     data = sys.argv[sys.argv.index("--data") + 1] if "--data" in sys.argv else DATA_DEFAULT
+    fmt = sys.argv[sys.argv.index("--format") + 1] if "--format" in sys.argv else "pt"
+    task = sys.argv[sys.argv.index("--task") + 1] if "--task" in sys.argv else "classify"
+    in_dim = int(sys.argv[sys.argv.index("--in-dim") + 1]) if "--in-dim" in sys.argv else 784
+    out_dim = int(sys.argv[sys.argv.index("--out-dim") + 1]) if "--out-dim" in sys.argv else 10
     device = "mps" if torch.backends.mps.is_available() else "cpu"
-    s = Shrinker(data, device, out)
+    s = Shrinker(data, device, out, data_format=fmt, task=task,
+                 in_dim=in_dim, out_dim=out_dim)
 
     t = torch.load(teacher, map_location="cpu")
     # seed first layer: prune teacher rows by output-column norm to n_start
