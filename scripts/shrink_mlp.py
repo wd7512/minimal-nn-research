@@ -19,6 +19,7 @@ Usage:
 Checkpoints: best<N>_<M>_<K>.pt per passing shape, final.json at the end.
 """
 import sys
+import copy
 import torch
 from pathlib import Path
 import torch.nn as nn
@@ -81,12 +82,13 @@ def eliminate_last(sd, widths):
 class Shrinker:
     def __init__(self, data, device, out, data_format="pt", task="classify", tol=0.1,
                  in_dim=784, out_dim=10):
+        torch.set_default_dtype(torch.float32)  # pin everything to float32
         if data_format == "chess":
             sys.path.insert(0, "/Users/williamdennis/repos/minimal-nn-competition/src")
             from minimal_nn_competition.benchmarks.chess_eval.benchmark import load_tensors
             X, y = load_tensors(data)
-            self.Xn = X.to(device)
-            self.yn = y.to(device)
+            self.Xn = X.float().to(device)
+            self.yn = y.float().to(device)
         else:
             XP, yP = torch.load(data, map_location="cpu", weights_only=True)
             self.Xn = (XP.float() / 255.0).to(device)
@@ -100,17 +102,23 @@ class Shrinker:
         self.lf = nn.MSELoss() if task == "regress" else nn.CrossEntropyLoss()
 
     def score(self, model):
-        """Fraction of samples within tolerance (exact match for classify)."""
-        model.eval()
+        """Fraction of samples within tolerance (exact match for classify).
+
+        Always evaluated on CPU in float32, matching the official evaluator,
+        so MPS rounding can't flip borderline samples at the gate.
+        """
+        mc = copy.deepcopy(model).cpu().float().eval()
         good = 0
         total = len(self.Xn)
         with torch.no_grad():
-            for b in torch.arange(total, device=self.device).split(8192):
+            for b in torch.arange(total).split(8192):
+                xb = self.Xn[b].cpu()
+                yb = self.yn[b].cpu()
                 if self.task == "regress":
-                    err = (model(self.Xn[b]).squeeze(1) - self.yn[b]).abs()
+                    err = (mc(xb).squeeze(1) - yb).abs()
                     good += (err <= self.tol).sum().item()
                 else:
-                    good += (model(self.Xn[b]).argmax(1) == self.yn[b]).sum().item()
+                    good += (mc(xb).argmax(1) == yb).sum().item()
         return good / total
 
     def evaluate(self, model):
@@ -154,7 +162,7 @@ class Shrinker:
 
     def load_into(self, widths, sd):
         """Warm-start: copy every layer present in both; fresh-init the rest."""
-        model = build(widths, self.in_dim, self.out_dim).to(self.device)
+        model = build(widths, self.in_dim, self.out_dim).to(self.device).float()
         own = model.state_dict()
         with torch.no_grad():
             for k, v in sd.items():
@@ -236,6 +244,11 @@ def main():
                  in_dim=in_dim, out_dim=out_dim)
 
     t = torch.load(teacher, map_location="cpu")
+    # fix at float32: cast any non-float32 checkpoint tensors on load
+    for k, v in list(t.items()):
+        if torch.is_tensor(v) and torch.is_floating_point(v) and v.dtype != torch.float32:
+            print(f"casting {k} from {v.dtype} to float32", flush=True)
+            t[k] = v.float()
     # seed first layer: prune teacher rows by output-column norm to n_start
     W2, n = t["2.weight"], widths[0]
     keep = sorted(range(W2.shape[1]), key=lambda i: W2[:, i].abs().sum().item(), reverse=True)[:n]
