@@ -256,6 +256,12 @@ def main():
     if len(widths) > 1:
         sd["2.weight"] = t["2.weight"][:, keep] if t["2.weight"].shape[1] == len(keep) else None
         sd["2.bias"] = t["2.bias"] if "2.bias" in t and t["2.bias"].shape[0] == t["2.weight"].shape[0] else None
+    if len(widths) == 2 and "4.weight" in t and tuple(t["4.weight"].shape) == (out_dim, widths[1]):
+        # copy the teacher readout: without it every 2-layer seed starts from a
+        # random head and has to rediscover the mapping from scratch
+        sd["4.weight"] = t["4.weight"].clone()
+        if "4.bias" in t and tuple(t["4.bias"].shape) == (out_dim,):
+            sd["4.bias"] = t["4.bias"].clone()
     if identity_k and len(widths) == 3 and "4.weight" in t and t["4.weight"].shape == (out_dim, widths[1]):
         # init the fresh K layer as a pass-through of the first K neurons, so the
         # 3-layer seed starts near the 2-layer teacher instead of from scratch
