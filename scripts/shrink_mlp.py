@@ -154,12 +154,12 @@ class Shrinker:
                     own[k].copy_(v.to(self.device))
         return model
 
-    def attempt(self, widths, sd, tag, lrs=(3e-3, 1e-3, 3e-4)):
+    def attempt(self, widths, sd, tag, lrs=(3e-3, 1e-3, 3e-4), max_ep=MAX_EP):
         """Train a shape to perfect, retrying with smaller LRs on failure."""
         model = self.load_into(widths, sd)
         best, bs = 0.0, None
         for lr in lrs:
-            best, bs = self.train_to_perfect(model, f"{tag}-lr{lr}", lr=lr)
+            best, bs = self.train_to_perfect(model, f"{tag}-lr{lr}", max_ep=max_ep, lr=lr)
             if best == 1.0:
                 name = "best" + "_".join(map(str, widths)) + ".pt"
                 torch.save(bs, self.out / name)
@@ -209,7 +209,12 @@ class Shrinker:
 
 def main():
     teacher = sys.argv[1]
-    widths = list(map(int, sys.argv[2:5]))
+    rest = sys.argv[2:]
+    widths = []
+    for a in rest:
+        if a.startswith("--"):
+            break
+        widths.append(int(a))
     out = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else SCRATCH_FALLBACK
     out.mkdir(parents=True, exist_ok=True)
     data = sys.argv[sys.argv.index("--data") + 1] if "--data" in sys.argv else DATA_DEFAULT
@@ -229,8 +234,9 @@ def main():
     if len(widths) > 1:
         sd["2.weight"] = t["2.weight"][:, keep] if t["2.weight"].shape[1] == len(keep) else None
     model = s.load_into(widths, {k: v for k, v in sd.items() if v is not None})
-    best, bs = s.train_to_perfect(model, "seed-" + "-".join(map(str, widths)))
-    if best != 1.0:
+    seed_tag = "seed-" + "-".join(map(str, widths))
+    best, bs = s.attempt(widths, {k: v for k, v in sd.items() if v is not None}, seed_tag)
+    if best != 1.0 or bs is None:
         print("seed shape failed; abort", flush=True)
         sys.exit(1)
     sd = bs
